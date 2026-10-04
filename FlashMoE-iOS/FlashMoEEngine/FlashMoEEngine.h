@@ -30,6 +30,17 @@ typedef int (*FlashMoETokenCallback)(
     void *user_data             // User context pointer
 );
 
+// ---- Load progress callback ----
+// Called on the loading thread as flashmoe_load() moves through its phases.
+// `stage` is a short human-readable phase name; `step` counts completed phases
+// out of `total`. Optional — leave NULL in the config to skip progress reports.
+typedef void (*FlashMoELoadProgressCallback)(
+    const char *stage,          // e.g. "Mapping dense weights"
+    int step,                   // Phases completed so far
+    int total,                  // Total phases in this load
+    void *user_data             // User context pointer
+);
+
 // ---- Configuration ----
 typedef struct {
     const char *model_path;     // Path to model directory (contains config.json, packed_experts/, etc.)
@@ -39,6 +50,9 @@ typedef struct {
     int use_2bit;               // 1 = use 2-bit experts (packed_experts_2bit/)
     int cache_io_split;         // >1 = split each expert pread into N page-aligned chunks (fanout), 0/1 = disabled
     int verbose;                // 1 = log to stderr, 0 = quiet
+    int enable_timing;          // 1 = accumulate per-phase layer timings for stats
+    FlashMoELoadProgressCallback progress_cb;  // Optional load progress callback
+    void *progress_user_data;   // Passed back to progress_cb
 } FlashMoEConfig;
 
 // ---- Engine stats ----
@@ -66,6 +80,17 @@ typedef struct {
     int tokens_generated;
     double total_time_ms;
     double ttft_ms;             // Time to first token
+
+    // Per-layer phase timing (averages in ms, zero unless enable_timing was set).
+    // The four phases sum to phase_total_ms and mirror the engine's pipeline:
+    // attention projections + delta-net, o_proj + routing, expert reads from
+    // storage, then expert compute + combine.
+    double phase_attn_ms;
+    double phase_proj_ms;
+    double phase_expert_io_ms;
+    double phase_expert_compute_ms;
+    double phase_total_ms;
+    int phase_layers_sampled;   // 0 = no timing data yet
 
     // Memory
     size_t weight_file_bytes;   // Non-expert weights (mmap'd)

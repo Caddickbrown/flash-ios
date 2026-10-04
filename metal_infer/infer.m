@@ -105,6 +105,11 @@ typedef struct {
     float rope_theta;
     float partial_rotary;
     float rms_norm_eps;
+    // 0 once a config.json declares a model_type this engine cannot run.
+    // The forward pass is specific to the Qwen3.5-MoE hybrid, so loading a
+    // foreign architecture would otherwise produce silent garbage.
+    int arch_supported;
+    char arch_name[64];
     // Derived
     int linear_total_key;    // linear_num_k_heads * linear_key_dim
     int linear_total_value;  // linear_num_v_heads * linear_value_dim
@@ -148,6 +153,8 @@ static void config_init_defaults(void) {
     g_cfg.rope_theta = 10000000.0f;
     g_cfg.partial_rotary = 0.25f;
     g_cfg.rms_norm_eps = 1e-6f;
+    g_cfg.arch_supported = 1;
+    snprintf(g_cfg.arch_name, sizeof(g_cfg.arch_name), "qwen3_5_moe");
     // Derived
     g_cfg.linear_total_key = g_cfg.linear_num_k_heads * g_cfg.linear_key_dim;
     g_cfg.linear_total_value = g_cfg.linear_num_v_heads * g_cfg.linear_value_dim;
@@ -1012,6 +1019,29 @@ static void load_config_from_config_json(const char *model_path) {
         NSDictionary *cfg = root[@"text_config"];
         if (!cfg) cfg = root;
 
+        // ---- Architecture gate ----
+        // This engine's forward pass is specific to the Qwen3.5-MoE hybrid:
+        // GatedDeltaNet linear attention, periodic full-attention layers, and a
+        // MoE block with a shared expert. Other architectures (GLM's glm_moe_dsa,
+        // Qwen's qwen4_exp, plain dense qwen3_5, ...) share none of that. Without
+        // this check the loader would read whatever keys it recognised, miss the
+        // rest, and emit garbage tokens rather than failing.
+        NSString *mt = cfg[@"model_type"];
+        if (!mt) mt = root[@"model_type"];
+        if ([mt isKindOfClass:[NSString class]]) {
+            snprintf(g_cfg.arch_name, sizeof(g_cfg.arch_name), "%s", [mt UTF8String]);
+            // qwen3_5_moe (multimodal wrapper) and qwen3_5_moe_text (text tower)
+            if (![mt hasPrefix:@"qwen3_5_moe"]) {
+                g_cfg.arch_supported = 0;
+                fprintf(stderr,
+                    "[config] ERROR: unsupported model_type '%s'\n"
+                    "         This engine only runs Qwen3.5-MoE style models "
+                    "(qwen3_5_moe / qwen3_5_moe_text).\n",
+                    [mt UTF8String]);
+                return;
+            }
+        }
+
         if (cfg[@"hidden_size"])         g_cfg.hidden_dim = [cfg[@"hidden_size"] intValue];
         if (cfg[@"num_hidden_layers"])   g_cfg.num_layers = [cfg[@"num_hidden_layers"] intValue];
         if (cfg[@"num_attention_heads"]) g_cfg.num_attn_heads = [cfg[@"num_attention_heads"] intValue];
@@ -1023,6 +1053,43 @@ static void load_config_from_config_json(const char *model_path) {
         if (cfg[@"moe_intermediate_size"]) g_cfg.moe_intermediate = [cfg[@"moe_intermediate_size"] intValue];
         if (cfg[@"shared_expert_intermediate_size"]) g_cfg.shared_intermediate = [cfg[@"shared_expert_intermediate_size"] intValue];
         if (cfg[@"full_attention_interval"]) g_cfg.full_attn_interval = [cfg[@"full_attention_interval"] intValue];
+
+        // Qwen3.6+ describes the hybrid layout as an explicit per-layer array
+        // rather than a single interval. Derive the interval from it so we are
+        // not silently relying on the built-in default of 4.
+        NSArray *layer_types = cfg[@"layer_types"];
+        if ([layer_types isKindOfClass:[NSArray class]] && layer_types.count > 0) {
+            int prev = -1, interval = 0, uniform = 1, n_full = 0, first = -1;
+            for (NSUInteger i = 0; i < layer_types.count; i++) {
+                id lt = layer_types[i];
+                if (![lt isKindOfClass:[NSString class]]) continue;
+                if (![(NSString *)lt isEqualToString:@"full_attention"]) continue;
+                n_full++;
+                if (first < 0) first = (int)i;
+                if (prev >= 0) {
+                    int gap = (int)i - prev;
+                    if (interval == 0)        interval = gap;
+                    else if (gap != interval) uniform = 0;
+                }
+                prev = (int)i;
+            }
+            if (interval > 0) {
+                // The forward pass places full attention where (i+1) % interval == 0,
+                // so a conforming layout has its first full layer at index interval-1.
+                if (!uniform || first != interval - 1) {
+                    fprintf(stderr,
+                        "[config] WARNING: layer_types is not a uniform "
+                        "'every %d-th layer' pattern (first full-attention layer at "
+                        "index %d, %d full layers total). The forward pass assumes a "
+                        "uniform interval — output may be incorrect.\n",
+                        interval, first, n_full);
+                }
+                g_cfg.full_attn_interval = interval;
+                printf("[config] layer_types: interval=%d, %d full-attention layers\n",
+                       interval, n_full);
+            }
+        }
+
         if (cfg[@"rms_norm_eps"])        g_cfg.rms_norm_eps = [cfg[@"rms_norm_eps"] floatValue];
         if (cfg[@"linear_num_value_heads"]) g_cfg.linear_num_v_heads = [cfg[@"linear_num_value_heads"] intValue];
         if (cfg[@"linear_num_key_heads"])   g_cfg.linear_num_k_heads = [cfg[@"linear_num_key_heads"] intValue];

@@ -24,23 +24,74 @@ import os
 import time
 import sys
 
-# Component order and expected sizes
-COMPONENTS = [
-    {"name": "gate_proj.weight",  "offset": 0,       "size": 2097152, "dtype": "U32", "shape": [1024, 512]},
-    {"name": "gate_proj.scales",  "offset": 2097152,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "gate_proj.biases",  "offset": 2228224,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "up_proj.weight",    "offset": 2359296,  "size": 2097152, "dtype": "U32", "shape": [1024, 512]},
-    {"name": "up_proj.scales",    "offset": 4456448,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "up_proj.biases",    "offset": 4587520,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "down_proj.weight",  "offset": 4718592,  "size": 2097152, "dtype": "U32", "shape": [4096, 128]},
-    {"name": "down_proj.scales",  "offset": 6815744,  "size": 131072,  "dtype": "BF16", "shape": [4096, 16]},
-    {"name": "down_proj.biases",  "offset": 6946816,  "size": 131072,  "dtype": "BF16", "shape": [4096, 16]},
+# Packed component order. The engine reads experts as a contiguous blob in
+# exactly this sequence, so the order is part of the on-disk format and must
+# not change. Sizes/shapes are NOT fixed — they are derived per model from
+# expert_index.json by derive_layout(), so this script works for any
+# Qwen3.5-MoE-family model (397B, 122B, 35B, Qwen3.6, ...) rather than only
+# the 397B it was originally written for.
+COMPONENT_ORDER = [
+    "gate_proj.weight", "gate_proj.scales", "gate_proj.biases",
+    "up_proj.weight",   "up_proj.scales",   "up_proj.biases",
+    "down_proj.weight", "down_proj.scales", "down_proj.biases",
 ]
 
-EXPERT_SIZE = 7077888   # bytes per expert
-NUM_EXPERTS = 512
-NUM_LAYERS = 60
-LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE  # 3,623,878,656 bytes (~3.63 GB)
+# Populated by derive_layout() once the index is loaded.
+COMPONENTS = []
+EXPERT_SIZE = 0
+NUM_EXPERTS = 0
+NUM_LAYERS = 0
+LAYER_SIZE = 0
+
+
+def derive_layout(expert_reads):
+    """Derive the packed layout from expert_index.json.
+
+    build_expert_index.py already records each component's per-expert size and
+    the full tensor shape ([num_experts, rows, cols]), so every geometry
+    constant this script needs can be read off the index instead of assuming a
+    particular model.
+    """
+    global COMPONENTS, EXPERT_SIZE, NUM_EXPERTS, NUM_LAYERS, LAYER_SIZE
+
+    if not expert_reads:
+        raise SystemExit("ERROR: expert_index.json contains no layers")
+
+    layer_keys = sorted(expert_reads, key=int)
+    NUM_LAYERS = len(layer_keys)
+    first = expert_reads[layer_keys[0]]
+
+    missing = [c for c in COMPONENT_ORDER if c not in first]
+    if missing:
+        raise SystemExit(
+            f"ERROR: layer {layer_keys[0]} is missing expert components {missing}.\n"
+            "       This model's MoE block does not match the expected "
+            "gate/up/down layout."
+        )
+
+    # shape is [num_experts, rows, cols]
+    NUM_EXPERTS = first[COMPONENT_ORDER[0]]["shape"][0]
+
+    COMPONENTS = []
+    offset = 0
+    for name in COMPONENT_ORDER:
+        info = first[name]
+        size = info["expert_size"]
+        COMPONENTS.append({
+            "name": name,
+            "offset": offset,
+            "size": size,
+            "dtype": "U32" if name.endswith(".weight") else "BF16",
+            "shape": list(info["shape"][1:]),
+        })
+        offset += size
+
+    EXPERT_SIZE = offset
+    LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE
+
+    print(f"Derived layout: {NUM_LAYERS} layers, {NUM_EXPERTS} experts/layer, "
+          f"{EXPERT_SIZE:,} B/expert, {LAYER_SIZE/1024**3:.2f} GB/layer")
+    return COMPONENTS
 
 
 def parse_layers(spec):
@@ -66,7 +117,11 @@ def load_index(index_path):
 
 
 def verify_component_sizes(expert_reads):
-    """Verify that component sizes in the index match expected sizes."""
+    """Verify every layer matches the geometry derived from the first layer.
+
+    COMPONENTS is derived from layer 0 by derive_layout(), so this catches a
+    model whose layers are not uniform — which the packed format cannot express.
+    """
     expected = {c['name']: c['size'] for c in COMPONENTS}
     for layer_key, comps in expert_reads.items():
         for comp_name, info in comps.items():
@@ -228,7 +283,11 @@ def main():
     print(f"Model path: {model_path}")
     print(f"Layers in index: {len(expert_reads)}")
 
-    # Verify component sizes
+    # Derive the packed geometry for THIS model before anything reads the
+    # layout constants (parse_layers needs NUM_LAYERS, verify needs COMPONENTS).
+    derive_layout(expert_reads)
+
+    # Verify every layer agrees with the geometry derived from layer 0
     if not verify_component_sizes(expert_reads):
         print("ABORTING: component size mismatch")
         sys.exit(1)

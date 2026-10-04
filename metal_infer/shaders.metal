@@ -61,6 +61,7 @@ struct GGUFBlockQ6K {
     ushort d;
 };
 
+__attribute__((unused))
 static inline uchar2 flash_moe_get_scale_min_k4(uint j, device const uchar *q) {
     return j < 4 ? uchar2{uchar(q[j] & 63), uchar(q[j + 4] & 63)}
                  : uchar2{uchar((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4)),
@@ -243,6 +244,7 @@ kernel void dequant_matvec_iq4_xs(
     }
 }
 
+__attribute__((unused))
 static inline uchar2 flash_moe_get_scale_min_k4_just2(uint j, device const uchar *q) {
     if (j < 4) {
         return uchar2{uchar(q[j + 0] & 63), uchar(q[j + 4] & 63)};
@@ -1335,10 +1337,18 @@ kernel void attn_softmax_batched(
     if (simd_group == 0 && simd_lane < num_simd_groups) {
         global_max = simd_max(shared_max[simd_lane]);
     }
+    // Threadgroup broadcast: thread 0 writes, barrier, all threads read. The
+    // compiler analyses a single thread's control flow and cannot see the
+    // cross-thread write, so it wrongly reports a read of an uninitialized
+    // value. threadgroup variables cannot carry an initializer, so scope the
+    // diagnostic instead.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wsometimes-uninitialized"
     threadgroup float broadcast_max;
     if (lid == 0) broadcast_max = global_max;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     global_max = broadcast_max;
+#pragma clang diagnostic pop
 
     // Pass 2: exp and sum
     threadgroup float shared_sum[32];
@@ -1356,10 +1366,14 @@ kernel void attn_softmax_batched(
     if (simd_group == 0 && simd_lane < num_simd_groups) {
         global_sum = simd_sum(shared_sum[simd_lane]);
     }
+    // Same cross-thread broadcast pattern as broadcast_max above.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wsometimes-uninitialized"
     threadgroup float broadcast_sum;
     if (lid == 0) broadcast_sum = global_sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     global_sum = broadcast_sum;
+#pragma clang diagnostic pop
 
     // Pass 3: normalize
     float inv_sum = 1.0f / global_sum;
@@ -1570,6 +1584,10 @@ kernel void rms_norm_qk(
     }
 
     // RMS norm for k
+    // Written by tid 0 after a barrier, then read by all threads — same
+    // cross-thread broadcast pattern the compiler cannot model.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wsometimes-uninitialized"
     threadgroup float k_sum_sq;
     float kval = (tid < key_dim) ? k[base + tid] : 0;
     threadgroup float k_partial[128];
@@ -1582,6 +1600,7 @@ kernel void rms_norm_qk(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float k_inv_rms = rsqrt(k_sum_sq / float(key_dim) + 1e-6f);
+#pragma clang diagnostic pop
     if (tid < key_dim) {
         k[base + tid] = kval * k_inv_rms * inv_scale;
     }

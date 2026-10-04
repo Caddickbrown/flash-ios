@@ -77,6 +77,47 @@ enum ModelCatalog {
             expertLayers: 40,
             files: makeTieredFileList()
         ),
+
+        // -- Qwen 3.6 35B-A3B 4-bit --
+        //
+        // The engine supports this model as of the layer_types/model_type work:
+        // mlx-community/Qwen3.6-35B-A3B-4bit is model_type qwen3_5_moe with
+        // 256 experts, K=8, 40 layers — the same shape as the 3.5 entry above.
+        //
+        // It is commented out because catalog entries point at *pre-packed*
+        // repos, and no Qwen3.6 FlashMoE pack exists yet. To enable it:
+        //
+        //   1. python repack_experts.py --model <mlx Qwen3.6-35B-A3B-4bit>
+        //   2. python metal_infer/extract_weights.py --model <same>
+        //   3. Upload config.json, model_weights.{bin,json}, vocab.bin,
+        //      tokenizer.{json,bin} and packed_experts/ to a HF repo.
+        //   4. Uncomment, set repoId, and replace every size below with the
+        //      real byte counts from the upload.
+        //
+        // Note: Qwen3.6 has vocab_size 248320, so vocab.bin/tokenizer.bin must
+        // be regenerated — the 3.5 artifacts above are NOT interchangeable.
+        //
+        // CatalogEntry(
+        //     id: "qwen3.6-35b-a3b-q4",
+        //     displayName: "Qwen 3.6 35B-A3B",
+        //     repoId: "<your-hf-account>/Qwen3.6-35B-A3B-Q4-FlashMoE",
+        //     description: "Qwen 3.6 35B MoE. 3B active params per token.",
+        //     totalSizeBytes: 0,   // TODO: real total after packing
+        //     quantization: "4-bit",
+        //     expertLayers: 40,
+        //     files: makeFileList(
+        //         configFiles: [
+        //             ("config.json", 0),          // TODO
+        //             ("model_weights.json", 0),   // TODO
+        //             ("model_weights.bin", 0),    // TODO
+        //             ("vocab.bin", 0),            // TODO
+        //             ("tokenizer.json", 0),       // TODO
+        //             ("tokenizer.bin", 0),        // TODO
+        //         ],
+        //         expertLayers: 40,
+        //         expertLayerSize: 0               // TODO
+        //     )
+        // ),
     ]
 
     // MARK: - Helpers

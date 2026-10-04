@@ -20,6 +20,54 @@ struct GenerationToken {
     let tokensPerSecond: Double
 }
 
+/// A phase of flashmoe_load(), as reported by the engine's progress callback.
+struct LoadPhase: Equatable {
+    let stage: String
+    let step: Int
+    let total: Int
+
+    var fraction: Double { total > 0 ? Double(step) / Double(total) : 0 }
+}
+
+/// Average time spent in each pipeline phase of one layer, in milliseconds.
+/// Only populated while the engine is built with timing enabled.
+struct LayerTiming: Equatable {
+    let attention: Double
+    let projection: Double
+    let expertIO: Double
+    let expertCompute: Double
+    let total: Double
+    let layersSampled: Int
+
+    var isEmpty: Bool { layersSampled == 0 || total <= 0 }
+
+    /// The four phases as fractions of the layer total, for the breakdown bar.
+    var shares: [(label: String, value: Double, fraction: Double)] {
+        let sum = max(attention + projection + expertIO + expertCompute, 0.0001)
+        return [
+            ("Attention + delta-net", attention, attention / sum),
+            ("Projection + routing", projection, projection / sum),
+            ("Expert read from storage", expertIO, expertIO / sum),
+            ("Expert compute + combine", expertCompute, expertCompute / sum)
+        ]
+    }
+}
+
+extension LayerTiming {
+    /// Nil when the engine has not accumulated any layers yet.
+    init?(stats: FlashMoEStats) {
+        guard stats.phase_layers_sampled > 0 else { return nil }
+        self.init(
+            attention: stats.phase_attn_ms,
+            projection: stats.phase_proj_ms,
+            expertIO: stats.phase_expert_io_ms,
+            expertCompute: stats.phase_expert_compute_ms,
+            total: stats.phase_total_ms,
+            layersSampled: Int(stats.phase_layers_sampled)
+        )
+    }
+}
+
 /// Model information after loading
 struct ModelInfo {
     let name: String
@@ -97,6 +145,8 @@ final class FlashMoEEngine: @unchecked Sendable {
     private(set) var tokensPerSecond: Double = 0
     private(set) var tokensGenerated: Int = 0
     private(set) var timeToFirstToken: Double = 0
+    private(set) var loadPhase: LoadPhase?
+    private(set) var layerTiming: LayerTiming?
 
     /// Smoke test mode: model has fewer than 512 experts (degraded, skip chat template)
     var isSmoke: Bool { (modelInfo?.numExperts ?? 512) < 512 }
@@ -119,12 +169,17 @@ final class FlashMoEEngine: @unchecked Sendable {
     /// Load a model from the given path. Runs on a background thread.
     func loadModel(at path: String, maxContext: Int = 0, thinkBudget: Int = 2048,
                    useTiered: Bool = false, use2bit: Bool = false,
-                   cacheIOSplit: Int = 1, verbose: Bool = false) async throws {
+                   cacheIOSplit: Int = 1, verbose: Bool = false,
+                   enableTiming: Bool = true) async throws {
         guard state != .loading && state != .generating else {
             throw FlashMoEError.busy
         }
 
-        await MainActor.run { state = .loading }
+        await MainActor.run {
+            state = .loading
+            loadPhase = nil
+            layerTiming = nil
+        }
 
         return try await withCheckedThrowingContinuation { continuation in
             engineQueue.async { [weak self] in
@@ -153,9 +208,23 @@ final class FlashMoEEngine: @unchecked Sendable {
                 config.use_2bit = use2bit ? 1 : 0
                 config.cache_io_split = Int32(cacheIOSplit)
                 config.verbose = verbose ? 1 : 0
+                config.enable_timing = enableTiming ? 1 : 0
+
+                // Load progress. The box is retained for the duration of the
+                // (synchronous) load call and released immediately after.
+                let progressBox = Unmanaged.passRetained(EngineRef(engine: self)).toOpaque()
+                config.progress_user_data = progressBox
+                config.progress_cb = { stage, step, total, userData in
+                    guard let userData, let stage else { return }
+                    let ref = Unmanaged<EngineRef>.fromOpaque(userData).takeUnretainedValue()
+                    let phase = LoadPhase(stage: String(cString: stage), step: Int(step), total: Int(total))
+                    guard let engine = ref.engine else { return }
+                    DispatchQueue.main.async { engine.loadPhase = phase }
+                }
 
                 // Load
                 let result = flashmoe_load(ctx, &config)
+                Unmanaged<EngineRef>.fromOpaque(progressBox).release()
                 if result != 0 {
                     let error = String(cString: flashmoe_last_error(ctx))
                     DispatchQueue.main.async { self.state = .error(error) }
@@ -195,11 +264,23 @@ final class FlashMoEEngine: @unchecked Sendable {
 
                 DispatchQueue.main.async {
                     self.modelInfo = info
+                    self.loadPhase = nil
                     self.state = .ready
                 }
                 continuation.resume()
             }
         }
+    }
+
+    /// Re-read the engine's per-phase layer timings. Safe to call while
+    /// generation is in flight — the accumulator is written by the engine
+    /// thread and read here as a snapshot.
+    func refreshTiming() {
+        guard let ctx = context, state == .ready || state == .generating else { return }
+        var stats = FlashMoEStats()
+        flashmoe_get_stats(ctx, &stats)
+        let timing = LayerTiming(stats: stats)
+        if timing != layerTiming { layerTiming = timing }
     }
 
     /// Unload the current model
@@ -209,6 +290,8 @@ final class FlashMoEEngine: @unchecked Sendable {
             flashmoe_unload(ctx)
         }
         modelInfo = nil
+        layerTiming = nil
+        loadPhase = nil
         state = .idle
     }
 
@@ -229,10 +312,13 @@ final class FlashMoEEngine: @unchecked Sendable {
                 self.isGenerating = true
             }
 
+            // The engine context is a bare C pointer, so it is not Sendable.
+            // Ownership stays with this object for the lifetime of the stream.
+            nonisolated(unsafe) let sendableCtx = ctx
+
             // Set up cancellation
-            nonisolated(unsafe) let ctxForCancel = ctx
             continuation.onTermination = { @Sendable _ in
-                flashmoe_cancel(ctxForCancel)
+                flashmoe_cancel(sendableCtx)
             }
 
             engineQueue.async { [weak self] in
@@ -242,7 +328,7 @@ final class FlashMoEEngine: @unchecked Sendable {
                 ).toOpaque()
 
                 let result = flashmoe_generate(
-                    ctx,
+                    sendableCtx,
                     prompt,
                     Int32(maxTokens),
                     { tokenText, tokenId, tokensGenerated, tokensPerSecond, userData -> Int32 in
@@ -277,13 +363,18 @@ final class FlashMoEEngine: @unchecked Sendable {
 
                 // Get final stats
                 var stats = FlashMoEStats()
-                flashmoe_get_stats(ctx, &stats)
+                flashmoe_get_stats(sendableCtx, &stats)
+
+                let timing = LayerTiming(stats: stats)
 
                 DispatchQueue.main.async {
                     self?.timeToFirstToken = stats.ttft_ms
                     self?.tokensPerSecond = stats.tokens_per_second
                     self?.tokensGenerated = Int(stats.tokens_generated)
-                    self?.state = .ready
+                    self?.layerTiming = timing
+                    // flashmoe_generate returns -1 on error. Without this the
+                    // failure surfaces as a successful but empty response.
+                    self?.state = result < 0 ? .error("Generation failed") : .ready
                     self?.isGenerating = false
                 }
 
@@ -308,9 +399,9 @@ final class FlashMoEEngine: @unchecked Sendable {
                 self.isGenerating = true
             }
 
-            nonisolated(unsafe) let ctxForCancel = ctx
+            nonisolated(unsafe) let sendableCtx = ctx
             continuation.onTermination = { @Sendable _ in
-                flashmoe_cancel(ctxForCancel)
+                flashmoe_cancel(sendableCtx)
             }
 
             engineQueue.async { [weak self] in
@@ -319,7 +410,7 @@ final class FlashMoEEngine: @unchecked Sendable {
                 ).toOpaque()
 
                 let result = flashmoe_generate_continuation(
-                    ctx,
+                    sendableCtx,
                     userMessage,
                     Int32(maxTokens),
                     { tokenText, tokenId, tokensGenerated, tokensPerSecond, userData -> Int32 in
@@ -361,13 +452,17 @@ final class FlashMoEEngine: @unchecked Sendable {
                 }
 
                 var stats = FlashMoEStats()
-                flashmoe_get_stats(ctx, &stats)
+                flashmoe_get_stats(sendableCtx, &stats)
+
+                let timing = LayerTiming(stats: stats)
 
                 DispatchQueue.main.async {
                     self?.timeToFirstToken = stats.ttft_ms
                     self?.tokensPerSecond = stats.tokens_per_second
                     self?.tokensGenerated = Int(stats.tokens_generated)
-                    self?.state = .ready
+                    self?.layerTiming = timing
+                    // -2 (context full) is handled above; -1 is a real failure.
+                    self?.state = result < 0 ? .error("Generation failed") : .ready
                     self?.isGenerating = false
                 }
 
@@ -391,8 +486,9 @@ final class FlashMoEEngine: @unchecked Sendable {
     /// Reset conversation state (KV cache, attention state)
     func reset() {
         guard let ctx = context else { return }
+        nonisolated(unsafe) let sendableCtx = ctx
         engineQueue.async {
-            flashmoe_reset(ctx)
+            flashmoe_reset(sendableCtx)
         }
     }
 
@@ -405,6 +501,15 @@ final class FlashMoEEngine: @unchecked Sendable {
 }
 
 // MARK: - Helper Types
+
+/// Bridging class to pass the engine through the C load-progress void* callback
+private final class EngineRef {
+    weak var engine: FlashMoEEngine?
+
+    init(engine: FlashMoEEngine?) {
+        self.engine = engine
+    }
+}
 
 /// Bridging class to pass Swift state through C void* callback
 private final class TokenCallbackContext {

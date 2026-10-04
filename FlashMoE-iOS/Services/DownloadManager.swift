@@ -43,6 +43,19 @@ final class DownloadManager: NSObject, @unchecked Sendable {
     private(set) var error: String?
     private(set) var downloadSpeed: Double = 0 // bytes/sec
 
+    /// Restrict downloads to Wi-Fi. A background session's own
+    /// allowsCellularAccess is fixed when the session is created, so this is
+    /// applied per request and takes effect on the next file.
+    var wifiOnly: Bool {
+        get { UserDefaults.standard.bool(forKey: Self.wifiOnlyKey) }
+        set { UserDefaults.standard.set(newValue, forKey: Self.wifiOnlyKey) }
+    }
+
+    /// Files finished so far in the active download.
+    func isFileComplete(_ filename: String) -> Bool {
+        activeDownload?.completedFiles.contains(filename) ?? false
+    }
+
     // Background session callback
     var backgroundCompletionHandler: (() -> Void)?
 
@@ -55,6 +68,7 @@ final class DownloadManager: NSObject, @unchecked Sendable {
     private var speedSampleBytes: UInt64 = 0
 
     private static let sessionIdentifier = "com.flashmoe.model-download"
+    private static let wifiOnlyKey = "downloadWifiOnly"
 
     // MARK: - Initialization
 
@@ -275,7 +289,9 @@ final class DownloadManager: NSObject, @unchecked Sendable {
         persistState()
 
         let url = entry.downloadURL(for: file)
-        let task = backgroundSession.downloadTask(with: url)
+        var request = URLRequest(url: url)
+        request.allowsCellularAccess = !wifiOnly
+        let task = backgroundSession.downloadTask(with: request)
         task.taskDescription = file.filename
         task.resume()
         currentTask = task

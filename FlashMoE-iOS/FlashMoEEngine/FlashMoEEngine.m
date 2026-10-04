@@ -12,7 +12,16 @@
 
 // Unity build — include the entire inference engine
 // This gives us access to all static functions and globals
+//
+// CHAT_MODE compiles out infer.m's CLI front-end, which leaves the helpers it
+// used to call unreferenced in this translation unit (the expert-cache,
+// prefetch and GGUF-overlay experiments, plus the timing/telemetry helpers).
+// They are still reachable in the macOS CLI build, so suppress the noise here
+// rather than delete code that build still needs.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wunused-function"
 #include "../../metal_infer/infer.m"
+#pragma clang diagnostic pop
 
 #include "FlashMoEEngine.h"
 #include <stdatomic.h>
@@ -59,7 +68,11 @@ struct FlashMoEContext {
 // Shader loading for iOS — find shaders.metal in the app bundle
 // ============================================================================
 
-// Override the shader search path for iOS: look in the app bundle first
+// Override the shader search path for iOS: look in the app bundle first.
+// Currently unreferenced: shaders.metal is compiled into default.metallib by the
+// Xcode build and loaded via newDefaultLibrary, so it is no longer a bundle
+// resource. Kept as the source-compilation fallback path.
+__attribute__((unused))
 static NSString *flashmoe_find_shader_source(void) {
     NSError *error = nil;
     NSString *src = nil;
@@ -112,6 +125,16 @@ FlashMoEContext *flashmoe_create(void) {
     return ctx;
 }
 
+// Total phases reported by flashmoe_load(). Keep in sync with the LOAD_PHASE
+// calls below — the loading UI shows step/total as a percentage.
+#define FLASHMOE_LOAD_PHASES 6
+
+static void flashmoe_report_phase(const FlashMoEConfig *config, const char *stage, int step) {
+    if (config && config->progress_cb) {
+        config->progress_cb(stage, step, FLASHMOE_LOAD_PHASES, config->progress_user_data);
+    }
+}
+
 int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
     if (!ctx || !config || !config->model_path) {
         if (ctx) snprintf(ctx->last_error, sizeof(ctx->last_error), "Invalid arguments");
@@ -141,6 +164,18 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
             load_config_from_manifest(manifest_path_buf);
         }
 
+        // Reject foreign architectures before touching any weights. Without this
+        // the engine would read the keys it recognised and emit garbage tokens.
+        if (!g_cfg.arch_supported) {
+            snprintf(ctx->last_error, sizeof(ctx->last_error),
+                     "Unsupported model architecture '%s' — this engine only runs "
+                     "Qwen3.5-MoE style models (qwen3_5_moe / qwen3_5_moe_text)",
+                     g_cfg.arch_name);
+            return -1;
+        }
+
+        flashmoe_report_phase(config, "Reading model config", 1);
+
         // Note: MAX_SEQ_LEN is a compile-time constant in infer.m.
         // KV caches are allocated at MAX_SEQ_LEN. On iOS, context is
         // effectively limited by available memory and max_tokens passed
@@ -151,6 +186,10 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
         if (config->think_budget > 0) {
             g_think_budget = config->think_budget;
         }
+
+        // Per-phase layer timing. Cheap (a handful of now_ms() calls per layer
+        // against ~6 ms of work) and it is what the telemetry breakdown reads.
+        g_timing_enabled = config->enable_timing ? 1 : 0;
 
         // Set quantization mode
         g_use_tiered = config->use_tiered;
@@ -178,6 +217,8 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
             NSLog(@"[FlashMoE] KV cache: %d positions (%.1f MB per cache x %d layers)",
                   ctx_limit, kv_per_cache / 1e6, g_cfg.num_full_attn_layers);
         }
+
+        flashmoe_report_phase(config, "Sizing KV cache", 2);
 
         // K = experts per token from config (capped to MAX_K)
         ctx->K = g_cfg.num_experts_per_tok;
@@ -207,6 +248,8 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
             return -1;
         }
 
+        flashmoe_report_phase(config, "Building Metal pipelines", 3);
+
         // ---- Initialize I/O thread pool ----
         io_pool_init();
 
@@ -216,6 +259,8 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
             snprintf(ctx->last_error, sizeof(ctx->last_error), "Failed to load weights from %s", weights_path);
             return -1;
         }
+
+        flashmoe_report_phase(config, "Mapping dense weights", 4);
 
         // Wrap weight file for Metal GPU access
         metal_set_weights(g_metal, ctx->wf->data, ctx->wf->size);
@@ -229,6 +274,8 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
 
         // ---- Initialize tokenizer ----
         init_tokenizer();
+
+        flashmoe_report_phase(config, "Loading tokenizer", 5);
 
         // ---- Auto-detect/load tiered manifest ----
         if (!g_use_2bit && !g_use_tiered) {
@@ -298,6 +345,8 @@ int flashmoe_load(FlashMoEContext *ctx, const FlashMoEConfig *config) {
                 }
             }
         }
+
+        flashmoe_report_phase(config, "Opening expert files", 6);
 
         // Log expert I/O mode
         {
@@ -612,6 +661,10 @@ int flashmoe_generate(
         ctx->tokens_generated = 0;
         ctx->tokens_per_second = 0;
 
+        // Phase timings are per-run, so the telemetry breakdown describes this
+        // generation rather than every one since the model was loaded.
+        if (g_timing_enabled) timing_reset();
+
         double t0 = now_ms();
 
         // ---- Tokenize prompt ----
@@ -852,6 +905,10 @@ int flashmoe_generate_continuation(
         atomic_store(&ctx->cancelled, 0);
         ctx->tokens_generated = 0;
         ctx->tokens_per_second = 0;
+
+        // Phase timings are per-run, so the telemetry breakdown describes this
+        // generation rather than every one since the model was loaded.
+        if (g_timing_enabled) timing_reset();
 
         double t0 = now_ms();
 
@@ -1124,6 +1181,22 @@ void flashmoe_get_stats(FlashMoEContext *ctx, FlashMoEStats *stats) {
     stats->tokens_generated = ctx->tokens_generated;
     stats->total_time_ms = ctx->total_time_ms;
     stats->ttft_ms = ctx->ttft_ms;
+
+    // Per-layer phase averages, bucketed the same way timing_print() reports
+    // them: CMD1 + CPU attention, CMD2 + routing, expert I/O, then CMD3 plus
+    // the deferred wait/combine for the previous layer's experts.
+    if (g_timing_enabled && g_timing.count > 0) {
+        double n = (double)g_timing.count;
+        stats->phase_attn_ms = (g_timing.cmd1_submit + g_timing.cmd1_wait
+                                + g_timing.cpu_attn + g_timing.input_norm) / n;
+        stats->phase_proj_ms = (g_timing.cmd2_encode + g_timing.cmd2_wait
+                                + g_timing.routing_cpu + g_timing.spec_route) / n;
+        stats->phase_expert_io_ms = g_timing.expert_io / n;
+        stats->phase_expert_compute_ms = (g_timing.cmd3_encode + g_timing.deferred_wait
+                                          + g_timing.deferred_cpu) / n;
+        stats->phase_total_ms = g_timing.total / n;
+        stats->phase_layers_sampled = g_timing.count;
+    }
 }
 
 int flashmoe_validate_model(const char *model_path) {
@@ -1133,6 +1206,25 @@ int flashmoe_validate_model(const char *model_path) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/config.json", model_path);
     if (access(path, R_OK) != 0) return -1;
+
+    // Reject foreign architectures during the model scan, so an incompatible
+    // model never reaches the loader. Parsed locally rather than via
+    // load_config_from_config_json() so a scan cannot clobber g_cfg for a
+    // model that is already loaded.
+    @autoreleasepool {
+        NSData *cfg_data = [NSData dataWithContentsOfFile:
+            [NSString stringWithUTF8String:path]];
+        if (!cfg_data) return -1;
+        NSDictionary *root = [NSJSONSerialization JSONObjectWithData:cfg_data
+                                                             options:0 error:nil];
+        if (![root isKindOfClass:[NSDictionary class]]) return -1;
+        NSDictionary *tc = root[@"text_config"];
+        NSString *mt = ([tc isKindOfClass:[NSDictionary class]] ? tc[@"model_type"] : nil);
+        if (!mt) mt = root[@"model_type"];
+        if ([mt isKindOfClass:[NSString class]] && ![mt hasPrefix:@"qwen3_5_moe"]) {
+            return -1;
+        }
+    }
 
     // Check model_weights.bin
     snprintf(path, sizeof(path), "%s/model_weights.bin", model_path);

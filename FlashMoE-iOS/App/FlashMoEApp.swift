@@ -14,10 +14,15 @@ struct FlashMoEApp: App {
 #endif
     @State private var engine: FlashMoEEngine = .init()
 
+    init() {
+        FMFonts.register()
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .environment(engine)
+                .preferredColorScheme(.dark)
         }
     }
 }

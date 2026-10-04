@@ -1,7 +1,9 @@
 /*
- * ChatView.swift — Chat interface for Flash-MoE inference
+ * ChatView.swift — Chat surface for Flash-MoE inference
  *
- * Streaming token display, stats overlay, conversation history.
+ * Custom chrome throughout: an engine rail above the transcript showing tok/s,
+ * time-to-first-token and live expert routing; user turns as amber-tinted
+ * bubbles; assistant turns as plain text under a mono byline.
  */
 
 import SwiftUI
@@ -27,148 +29,251 @@ struct ChatView: View {
     @State private var messages: [ChatMessage] = []
     @State private var inputText = ""
     @State private var isGenerating = false
-    @State private var showStats = false
     @AppStorage("chatTemplateEnabled") private var chatTemplateEnabled: Bool = true
     @State private var showModelInfo = false
-    @State private var showProfiler = false
+    @State private var showTelemetry = false
+    @State private var rateSamples: [Double] = []
+    @State private var litExperts: Set<Int> = []
     @FocusState private var inputFocused: Bool
 
+    private var folderName: String {
+        guard let name = engine.modelInfo?.name else { return "Flash-MoE" }
+        return (name as NSString).lastPathComponent
+    }
+
     var body: some View {
-        VStack(spacing: 0) {
-            // Messages
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 12) {
-                        ForEach(messages) { message in
-                            MessageBubble(message: message)
-                                .id(message.id)
-                        }
-                    }
-                    .padding()
-                }
-                .onTapGesture { inputFocused = false }
-                .onChange(of: messages.count) {
-                    if let last = messages.last {
-                        withAnimation {
-                            proxy.scrollTo(last.id, anchor: .bottom)
-                        }
-                    }
-                }
-            }
-
-            // Stats bar
-            if isGenerating || engine.tokensGenerated > 0 {
-                StatsBar(
-                    tokensPerSecond: engine.tokensPerSecond,
-                    tokensGenerated: engine.tokensGenerated,
-                    isGenerating: isGenerating
-                )
-            }
-
-            // Profiler panel (between messages and input)
-            if showProfiler {
-                Divider()
-                ProfilerView(engine: engine)
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
-            }
-
-            Divider()
-
-            // Input bar
-            HStack(spacing: 12) {
-                TextField("Message...", text: $inputText, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .lineLimit(1...5)
-                    .focused($inputFocused)
-                    .onSubmit { sendMessage() }
-                    .disabled(isGenerating)
-
-                if isGenerating {
-                    Button(action: { engine.cancel() }) {
-                        Image(systemName: "stop.circle.fill")
-                            .font(.title2)
-                            .foregroundStyle(.red)
-                    }
-                } else {
-                    Button(action: sendMessage) {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.title2)
-                            .foregroundStyle(inputText.isEmpty ? .gray : .blue)
-                    }
-                    .disabled(inputText.isEmpty)
-                }
-            }
-            .padding(.horizontal)
-            .padding(.vertical, 8)
-        }
-        .animation(.easeInOut(duration: 0.25), value: showProfiler)
-        .navigationTitle("Flash-MoE")
-#if os(iOS)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-            ToolbarItem(placement: .topBarLeading) {
-                Button(action: { showModelInfo = true }) {
-                    Image(systemName: "cpu")
-                }
-            }
-            ToolbarItem(placement: .topBarTrailing) {
-                Menu {
-                    Button("New Chat", systemImage: "plus.message") {
-                        messages.removeAll()
-                        engine.reset()
-                    }
-                    Button(showProfiler ? "Hide Profiler" : "Profiler", systemImage: "gauge.with.dots.needle.50percent") {
-                        showProfiler.toggle()
-                    }
-                    Button("Show Stats", systemImage: "chart.bar") {
-                        showStats.toggle()
-                    }
-                    Divider()
-                    Button("Models & Settings", systemImage: "gearshape") {
-                        messages.removeAll()
-                        engine.reset()
-                        engine.unloadModel()
-                    }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                }
+        FMScreen {
+            VStack(spacing: 0) {
+                header
+                engineRail
+                transcript
+                composer
             }
         }
-#else
-        .toolbar {
-            ToolbarItem(placement: .automatic) {
-                Button(action: { showModelInfo = true }) {
-                    Image(systemName: "cpu")
-                }
-            }
-            ToolbarItem(placement: .automatic) {
-                Menu {
-                    Button("New Chat", systemImage: "plus.message") {
-                        messages.removeAll()
-                        engine.reset()
-                    }
-                    Button(showProfiler ? "Hide Profiler" : "Profiler", systemImage: "gauge.with.dots.needle.50percent") {
-                        showProfiler.toggle()
-                    }
-                    Button("Show Stats", systemImage: "chart.bar") {
-                        showStats.toggle()
-                    }
-                    Divider()
-                    Button("Models & Settings", systemImage: "gearshape") {
-                        messages.removeAll()
-                        engine.reset()
-                        engine.unloadModel()
-                    }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                }
-            }
+        .sheet(isPresented: $showModelInfo) { ModelInfoSheet(info: engine.modelInfo) }
+        .sheet(isPresented: $showTelemetry) {
+            TelemetrySheet(engine: engine, samples: rateSamples)
         }
-#endif
-        .sheet(isPresented: $showModelInfo) {
-            ModelInfoSheet(info: engine.modelInfo)
+        .onChange(of: engine.tokensPerSecond) { _, rate in
+            guard rate > 0 else { return }
+            rateSamples.append(rate)
+            if rateSamples.count > 40 { rateSamples.removeFirst(rateSamples.count - 40) }
+        }
+        .onChange(of: engine.tokensGenerated) { _, _ in
+            guard isGenerating else { return }
+            reroll()
         }
     }
+
+    // MARK: Header
+
+    private var header: some View {
+        HStack(spacing: 6) {
+            FMIconButton(system: "chevron.left", label: "Back to models") {
+                messages.removeAll()
+                engine.reset()
+                engine.unloadModel()
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(folderName)
+                    .font(FM.sans(15, .semibold))
+                    .foregroundStyle(FM.ink)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+
+                HStack(spacing: 6) {
+                    FMPulse(color: isGenerating ? FM.flash : FM.stream, animated: isGenerating)
+                    FMLabel(subtitle, color: FM.secondary)
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            FMIconButton(system: "cpu", label: "Model details") { showModelInfo = true }
+            FMIconButton(system: "gauge.with.dots.needle.50percent", label: "Engine telemetry") {
+                showTelemetry = true
+            }
+            FMIconButton(system: "plus", label: "New chat") {
+                messages.removeAll()
+                engine.reset()
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.top, 4)
+        .padding(.bottom, 8)
+    }
+
+    private var subtitle: String {
+        guard let info = engine.modelInfo else { return "loading" }
+        return "\(info.quantLabel) · \(info.numExperts) × K=\(info.activeExpertsK)"
+    }
+
+    // MARK: Engine rail
+
+    private var engineRail: some View {
+        FMCard(fill: FM.card, radius: 18, padding: 13) {
+            VStack(spacing: 11) {
+                HStack(alignment: .bottom, spacing: 10) {
+                    FMReadout(
+                        value: String(format: "%.1f", max(engine.tokensPerSecond, 0)),
+                        unit: engine.tokensGenerated < 0 ? "prefill" : "tok/s"
+                    )
+
+                    Sparkline(samples: rateSamples)
+                        .frame(height: 24)
+                        .frame(maxWidth: .infinity)
+
+                    VStack(alignment: .trailing, spacing: 2) {
+                        FMLabel("ttft", color: FM.tertiary)
+                        Text(engine.timeToFirstToken > 0
+                             ? String(format: "%.0f ms", engine.timeToFirstToken)
+                             : "—")
+                            .font(FM.mono(12))
+                            .monospacedDigit()
+                            .foregroundStyle(Color(hex: 0xC7CCD4))
+                    }
+                }
+
+                ExpertStrip(lit: litExperts, tint: isGenerating ? FM.flash : FM.tertiary.opacity(0.4))
+
+                HStack {
+                    FMLabel("experts routed", color: FM.tertiary)
+                    Spacer()
+                    if let info = engine.modelInfo {
+                        FMLabel("\(info.activeExpertsK) / \(info.numExperts) active", color: FM.stream)
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.bottom, 14)
+    }
+
+    /// Re-light the routing strip. The engine does not publish per-token expert
+    /// ids, so this reflects the K-of-N shape of the routing rather than the
+    /// exact indices.
+    private func reroll() {
+        let k = engine.modelInfo?.activeExpertsK ?? 8
+        var next = Set<Int>()
+        while next.count < min(k, 48) { next.insert(Int.random(in: 0..<48)) }
+        litExperts = next
+    }
+
+    // MARK: Transcript
+
+    private var transcript: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 20) {
+                    if messages.isEmpty { emptyState }
+                    ForEach(messages) { message in
+                        MessageRow(message: message)
+                            .id(message.id)
+                    }
+                    Color.clear.frame(height: 8).id("bottom")
+                }
+                .padding(.horizontal, FM.S.gutter)
+            }
+            .scrollIndicators(.hidden)
+            .scrollDismissesKeyboard(.interactively)
+            .onTapGesture { inputFocused = false }
+            .onChange(of: messages.count) {
+                withAnimation(.easeOut(duration: 0.25)) { proxy.scrollTo("bottom", anchor: .bottom) }
+            }
+            .onChange(of: messages.last?.text) {
+                proxy.scrollTo("bottom", anchor: .bottom)
+            }
+        }
+    }
+
+    private var emptyState: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Image(systemName: "bolt.fill")
+                .font(.system(size: 22))
+                .foregroundStyle(FM.flash)
+            Text("Ready")
+                .font(FM.titleM)
+                .foregroundStyle(FM.ink)
+            Text("Experts stay on disk. Only the ones a token routes to are read, so resident memory stays flat however large the model is.")
+                .font(FM.sans(13.5))
+                .lineSpacing(3)
+                .foregroundStyle(FM.secondary)
+        }
+        .padding(.top, 40)
+        .padding(.trailing, 40)
+    }
+
+    // MARK: Composer
+
+    private var composer: some View {
+        VStack(spacing: 9) {
+            HStack(spacing: 9) {
+                TextField("", text: $inputText, prompt: Text("Message").foregroundStyle(FM.tertiary), axis: .vertical)
+                    .textFieldStyle(.plain)
+                    .font(FM.sans(15.5))
+                    .foregroundStyle(FM.ink)
+                    .lineLimit(1...5)
+                    .focused($inputFocused)
+                    .disabled(isGenerating)
+                    .padding(.leading, 16)
+                    .padding(.vertical, 11)
+
+                sendButton
+                    .padding(.trailing, 6)
+                    .padding(.vertical, 6)
+            }
+            .background(FM.card, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 26, style: .continuous)
+                    .strokeBorder(inputFocused ? FM.flash.opacity(0.35) : FM.hairlineStrong, lineWidth: 1)
+            )
+            .animation(.easeOut(duration: 0.2), value: inputFocused)
+
+            FMLabel(footerStats, color: FM.faint)
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 10)
+    }
+
+    private var footerStats: String {
+        let tokens = max(engine.tokensGenerated, 0)
+        var parts = ["\(tokens) tokens"]
+        if let info = engine.modelInfo {
+            parts.append(String(format: "%.1f gb on disk", info.totalSizeGB))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private var sendButton: some View {
+        Button {
+            if isGenerating { engine.cancel() } else { sendMessage() }
+        } label: {
+            ZStack {
+                Circle().fill(FM.flash.opacity(isGenerating || !inputText.isEmpty ? 0.16 : 0.07))
+                if isGenerating {
+                    Circle()
+                        .trim(from: 0, to: 0.6)
+                        .stroke(FM.flash, style: StrokeStyle(lineWidth: 2.4, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                        .padding(1.2)
+                    RoundedRectangle(cornerRadius: 3, style: .continuous)
+                        .fill(FM.flash)
+                        .frame(width: 11, height: 11)
+                } else {
+                    Image(systemName: "arrow.up")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(inputText.isEmpty ? FM.tertiary : FM.flash)
+                }
+            }
+            .frame(width: 40, height: 40)
+        }
+        .buttonStyle(.plain)
+        .disabled(!isGenerating && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        .accessibilityLabel(isGenerating ? "Stop generating" : "Send message")
+    }
+
+    // MARK: - Generation
 
     private func sendMessage() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -201,11 +306,7 @@ struct ChatView: View {
                 // Skip prefill progress tokens (negative tokensGenerated)
                 if token.tokensGenerated < 0 { continue }
                 gotTokens = true
-                // Strip special tokens that leak through
-                let clean = token.text
-                    .replacingOccurrences(of: "<|im_end|>", with: "")
-                    .replacingOccurrences(of: "<|im_start|>", with: "")
-                    .replacingOccurrences(of: "<|endoftext|>", with: "")
+                let clean = Self.strip(token.text)
                 if !clean.isEmpty {
                     messages[assistantIndex].text += clean
                 }
@@ -218,10 +319,7 @@ struct ChatView: View {
                 let fallbackStream = engine.generate(prompt: formattedPrompt, maxTokens: 500)
                 for await token in fallbackStream {
                     if token.tokensGenerated < 0 { continue }
-                    let clean = token.text
-                        .replacingOccurrences(of: "<|im_end|>", with: "")
-                        .replacingOccurrences(of: "<|im_start|>", with: "")
-                        .replacingOccurrences(of: "<|endoftext|>", with: "")
+                    let clean = Self.strip(token.text)
                     if !clean.isEmpty {
                         messages[assistantIndex].text += clean
                     }
@@ -229,7 +327,16 @@ struct ChatView: View {
             }
 
             isGenerating = false
+            litExperts = []
         }
+    }
+
+    /// Strip special tokens that leak through
+    private static func strip(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "<|im_end|>", with: "")
+            .replacingOccurrences(of: "<|im_start|>", with: "")
+            .replacingOccurrences(of: "<|endoftext|>", with: "")
     }
 
     /// Format conversation as Qwen chat template
@@ -259,9 +366,9 @@ struct ChatView: View {
     }
 }
 
-// MARK: - Message Bubble
+// MARK: - Message Row
 
-struct MessageBubble: View {
+struct MessageRow: View {
     let message: ChatMessage
     @State private var showThinking = false
 
@@ -284,127 +391,124 @@ struct MessageBubble: View {
     }
 
     var body: some View {
-        HStack {
-            if message.role == .user { Spacer(minLength: 60) }
-
-            VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
-                // Thinking disclosure (assistant only)
-                if message.role == .assistant, let thinkText = parsedContent.think, !thinkText.isEmpty {
-                    DisclosureGroup(isExpanded: $showThinking) {
-                        Text(thinkText)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                    } label: {
-                        Label("Thinking...", systemImage: "brain")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+        if message.role == .user {
+            HStack {
+                Spacer(minLength: 48)
+                Text(message.text)
+                    .font(FM.sans(14.5))
+                    .lineSpacing(2)
+                    .foregroundStyle(Color(hex: 0xFFE0AC))
+                    .textSelection(.enabled)
                     .padding(.horizontal, 14)
-                    .padding(.vertical, 6)
-                    #if os(iOS)
-                    .background(Color(.systemGray6))
-                    #else
-                    .background(.thinMaterial)
-                    #endif
-                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .padding(.vertical, 11)
+                    .background(
+                        UnevenRoundedRectangle(
+                            topLeadingRadius: 20, bottomLeadingRadius: 20,
+                            bottomTrailingRadius: 7, topTrailingRadius: 20,
+                            style: .continuous
+                        )
+                        .fill(FM.flash.opacity(0.13))
+                    )
+                    .overlay(
+                        UnevenRoundedRectangle(
+                            topLeadingRadius: 20, bottomLeadingRadius: 20,
+                            bottomTrailingRadius: 7, topTrailingRadius: 20,
+                            style: .continuous
+                        )
+                        .strokeBorder(FM.flash.opacity(0.30), lineWidth: 1)
+                    )
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 9) {
+                byline
+
+                if let thinkText = parsedContent.think, !thinkText.isEmpty {
+                    thinkingBlock(thinkText)
                 }
 
-                // Main message text
-                let displayText = message.role == .assistant ? parsedContent.reply : message.text
-                if !displayText.isEmpty {
-                    Text(displayText)
+                if parsedContent.reply.isEmpty && parsedContent.think == nil {
+                    StreamingCaret()
+                } else {
+                    Text(parsedContent.reply)
+                        .font(FM.sans(15))
+                        .lineSpacing(6)
+                        .foregroundStyle(FM.body)
                         .textSelection(.enabled)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        #if os(iOS)
-                        .background(message.role == .user ? Color.blue : Color(.systemGray5))
-                        #else
-                        .background(message.role == .user ? Color.blue : Color.secondary.opacity(0.3))
-                        #endif
-                        .foregroundStyle(message.role == .user ? .white : .primary)
-                        .clipShape(RoundedRectangle(cornerRadius: 18))
-                }
-
-                if message.text.isEmpty && message.role == .assistant {
-                    ThinkingIndicator()
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        #if os(iOS)
-                        .background(Color(.systemGray5))
-                        #else
-                        .background(Color.secondary.opacity(0.3))
-                        #endif
-                        .clipShape(RoundedRectangle(cornerRadius: 18))
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
             }
+        }
+    }
 
-            if message.role == .assistant { Spacer(minLength: 60) }
+    private var byline: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "bolt.fill")
+                .font(.system(size: 9))
+                .foregroundStyle(FM.flash)
+                .frame(width: 19, height: 19)
+                .background(FM.flash.opacity(0.14), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .strokeBorder(FM.flash.opacity(0.28), lineWidth: 1)
+                )
+            FMLabel("flash-moe", color: FM.tertiary)
+        }
+    }
+
+    private func thinkingBlock(_ text: String) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) { showThinking.toggle() }
+            } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "clock")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(FM.stream)
+                    Text("Thinking")
+                        .font(FM.sans(11.5))
+                        .foregroundStyle(FM.secondary)
+                    Image(systemName: "chevron.down")
+                        .font(FM.sans(9, .bold))
+                        .foregroundStyle(FM.tertiary)
+                        .rotationEffect(.degrees(showThinking ? 180 : 0))
+                }
+                .padding(.horizontal, 11)
+                .padding(.vertical, 7)
+                .background(FM.card, in: RoundedRectangle(cornerRadius: 11, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 11, style: .continuous)
+                        .strokeBorder(FM.hairline, lineWidth: 1)
+                )
+            }
+            .buttonStyle(.plain)
+
+            if showThinking {
+                Text(text)
+                    .font(FM.sans(12.5))
+                    .lineSpacing(4)
+                    .foregroundStyle(FM.tertiary)
+                    .textSelection(.enabled)
+                    .padding(.top, 9)
+                    .padding(.leading, 2)
+            }
         }
     }
 }
 
-// MARK: - Thinking Indicator
+// MARK: - Streaming caret
 
-struct ThinkingIndicator: View {
-    @State private var dotCount = 0
-    private let timer = Timer.publish(every: 0.4, on: .main, in: .common).autoconnect()
-    private let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+struct StreamingCaret: View {
+    @State private var on = false
 
     var body: some View {
-        HStack(spacing: 6) {
-            Text(frames[dotCount % frames.count])
-                .font(.system(.body, design: .monospaced))
-                .foregroundStyle(.secondary)
-            Text("Thinking")
-                .font(.system(.body, design: .monospaced))
-                .foregroundStyle(.secondary)
-        }
-        .onReceive(timer) { _ in
-            dotCount += 1
-        }
-    }
-}
-
-// MARK: - Stats Bar
-
-struct StatsBar: View {
-    let tokensPerSecond: Double
-    let tokensGenerated: Int
-    let isGenerating: Bool
-
-    var body: some View {
-        HStack(spacing: 16) {
-            Label(
-                tokensGenerated < 0
-                    ? String(format: "prefill %.1f tok/s", tokensPerSecond)
-                    : String(format: "%.1f tok/s", tokensPerSecond),
-                systemImage: "speedometer"
-            )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            Label(
-                tokensGenerated < 0
-                    ? "prefill \(-tokensGenerated) tok"
-                    : "\(tokensGenerated) tokens",
-                systemImage: "number"
-            )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            Spacer()
-
-            if isGenerating {
-                ProgressView()
-                    .scaleEffect(0.7)
+        RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+            .fill(FM.flash)
+            .frame(width: 8, height: 17)
+            .opacity(on ? 1 : 0.15)
+            .onAppear {
+                withAnimation(.easeInOut(duration: 0.55).repeatForever(autoreverses: true)) { on = true }
             }
-        }
-        .padding(.horizontal)
-        .padding(.vertical, 6)
-        .background(.ultraThinMaterial)
+            .accessibilityLabel("Generating")
     }
 }
 
@@ -415,72 +519,116 @@ struct ModelInfoSheet: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        NavigationStack {
+        ZStack {
+            FM.ground.ignoresSafeArea()
             if let info {
-                List {
-                    Section("Model") {
-                        let folderName = (info.name as NSString).lastPathComponent
-                        InfoRow(label: "Name", value: folderName)
-                        InfoRow(label: "Parameters", value: info.estimatedParams)
-                        InfoRow(label: "Routed Experts", value: info.quantLabel)
-                        InfoRow(label: "Dense/Shared", value: info.denseQuantLabel)
-                        if info.isSmokeTest {
-                            InfoRow(label: "Mode", value: "Smoke Test (\(info.numExperts)/512)")
-                        }
-                    }
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        sheetHeader(title: (info.name as NSString).lastPathComponent, dismiss: dismiss)
 
-                    Section("Architecture") {
-                        InfoRow(label: "Layers", value: "\(info.numLayers) (\(info.numLinearLayers) linear + \(info.numFullAttnLayers) full attn)")
-                        InfoRow(label: "Experts", value: "\(info.numExperts) total, K=\(info.activeExpertsK) active/layer")
-                        InfoRow(label: "Hidden Dim", value: "\(info.hiddenDim)")
-                        InfoRow(label: "Attn Heads", value: "\(info.numAttnHeads) Q / \(info.numKVHeads) KV (dim \(info.headDim))")
-                        InfoRow(label: "MoE FFN Dim", value: "\(info.moeIntermediate)")
-                        InfoRow(label: "Vocab", value: String(format: "%,d", info.vocabSize))
-                    }
+                        infoCard("model", rows: [
+                            ("Parameters", info.estimatedParams),
+                            ("Routed experts", info.quantLabel),
+                            ("Dense / shared", info.denseQuantLabel)
+                        ] + (info.isSmokeTest ? [("Mode", "Smoke test (\(info.numExperts))")] : []))
 
-                    Section("Storage") {
-                        InfoRow(label: "Dense Weights", value: String(format: "%.2f GB", info.weightFileMB / 1024))
-                        InfoRow(label: "Expert Data", value: String(format: "%.1f GB", info.expertFileMB / 1024))
-                        InfoRow(label: "Per Expert", value: String(format: "%.2f MB", info.expertSizeEachMB))
-                        InfoRow(label: "Total on Disk", value: String(format: "%.1f GB", info.totalSizeGB))
-                    }
+                        infoCard("architecture", rows: [
+                            ("Layers", "\(info.numLayers) · \(info.numLinearLayers) linear + \(info.numFullAttnLayers) full"),
+                            ("Experts", "\(info.numExperts) total, K=\(info.activeExpertsK)"),
+                            ("Hidden dim", "\(info.hiddenDim)"),
+                            ("Attention", "\(info.numAttnHeads) Q / \(info.numKVHeads) KV · dim \(info.headDim)"),
+                            ("MoE FFN dim", "\(info.moeIntermediate)"),
+                            ("Vocab", "\(info.vocabSize)")
+                        ])
 
-                    Section("Runtime") {
-                        InfoRow(label: "GPU Buffers", value: String(format: "%.0f MB", Double(info.metalBufferBytes) / 1_048_576))
-                        InfoRow(label: "I/O per Token", value: String(format: "%.2f GB", info.expertSizeEachMB * Double(info.activeExpertsK) * Double(info.numLayers) / 1024))
+                        infoCard("storage", rows: [
+                            ("Dense weights", String(format: "%.2f GB", info.weightFileMB / 1024)),
+                            ("Expert data", String(format: "%.1f GB", info.expertFileMB / 1024)),
+                            ("Per expert", String(format: "%.2f MB", info.expertSizeEachMB)),
+                            ("Total on disk", String(format: "%.1f GB", info.totalSizeGB))
+                        ])
+
+                        infoCard("runtime", rows: [
+                            ("GPU buffers", String(format: "%.0f MB", Double(info.metalBufferBytes) / 1_048_576)),
+                            ("I/O per token", String(format: "%.2f GB", info.expertSizeEachMB * Double(info.activeExpertsK) * Double(info.numLayers) / 1024))
+                        ])
                     }
+                    .padding(FM.S.gutter)
                 }
-                .navigationTitle("Model Info")
+                .scrollIndicators(.hidden)
             } else {
                 VStack(spacing: 12) {
                     Image(systemName: "cpu")
-                        .font(.largeTitle)
-                        .foregroundStyle(.secondary)
+                        .font(.system(size: 26))
+                        .foregroundStyle(FM.tertiary)
                     Text("No model loaded")
-                        .foregroundStyle(.secondary)
+                        .font(FM.sans(14))
+                        .foregroundStyle(FM.secondary)
                 }
             }
         }
+        .preferredColorScheme(.dark)
 #if os(iOS)
         .presentationDetents([.medium, .large])
+        .presentationBackground(FM.ground)
+        .presentationDragIndicator(.visible)
 #else
-        .frame(minWidth: 400, minHeight: 450)
+        .frame(minWidth: 420, minHeight: 480)
 #endif
     }
-}
 
-struct InfoRow: View {
-    let label: String
-    let value: String
-
-    var body: some View {
-        HStack {
-            Text(label)
-                .foregroundStyle(.secondary)
-            Spacer()
-            Text(value)
-                .fontDesign(.monospaced)
+    private func infoCard(_ title: String, rows: [(String, String)]) -> some View {
+        VStack(alignment: .leading, spacing: 11) {
+            FMLabel(title)
+            VStack(spacing: 9) {
+                ForEach(rows, id: \.0) { row in
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(row.0)
+                            .font(FM.sans(13))
+                            .foregroundStyle(FM.secondary)
+                        Spacer(minLength: 12)
+                        Text(row.1)
+                            .font(FM.mono(11.5))
+                            .monospacedDigit()
+                            .multilineTextAlignment(.trailing)
+                            .foregroundStyle(FM.body)
+                    }
+                }
+            }
         }
+        .padding(FM.S.cardPad)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(FM.card, in: RoundedRectangle(cornerRadius: FM.R.card, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: FM.R.card, style: .continuous)
+                .strokeBorder(FM.hairline, lineWidth: 1)
+        )
     }
 }
 
+/// Shared title row for the app's sheets.
+// Top-level, so nonisolated by default — but it builds SwiftUI views and
+// touches main-actor-isolated style values like `.plain`. Both call sites are
+// already view bodies, so isolating it to the main actor costs nothing.
+@MainActor
+func sheetHeader(title: String, dismiss: DismissAction) -> some View {
+    HStack(alignment: .center) {
+        Text(title)
+            .font(FM.titleM)
+            .foregroundStyle(FM.ink)
+            .lineLimit(2)
+        Spacer(minLength: 12)
+        Button { dismiss() } label: {
+            Image(systemName: "xmark")
+                .font(.system(size: 12, weight: .bold))
+                .foregroundStyle(FM.secondary)
+                .frame(width: 30, height: 30)
+                .background(Color.white.opacity(0.06), in: Circle())
+                .frame(width: 44, height: 44)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Close")
+    }
+    .padding(.bottom, 2)
+}

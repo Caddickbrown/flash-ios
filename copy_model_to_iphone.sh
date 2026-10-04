@@ -14,7 +14,7 @@
 
 set -e
 
-BUNDLE_ID="flashmoe.anemll.com"
+BUNDLE_ID="com.caddickbrown.flashmoe"
 
 if [ -z "$1" ]; then
     echo "Usage: $0 /path/to/model-directory [device-udid]"

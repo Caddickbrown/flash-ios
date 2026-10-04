@@ -1,9 +1,9 @@
 /*
- * ProfilerView.swift — Lightweight resource profiler overlay
+ * ProfilerView.swift — Engine telemetry
  *
- * Displays real-time system metrics during inference:
- * memory (RSS + available), thermal state, CPU usage,
- * and engine stats (tok/s, TTFT).
+ * SystemMetrics samples real-time resource use during inference:
+ * memory (RSS + available), thermal state and CPU. TelemetrySheet is the
+ * surface that presents it alongside the engine's own generation stats.
  *
  * All APIs are public (mach_task_info, os_proc_available_memory,
  * ProcessInfo.thermalState) — no entitlements needed.
@@ -125,150 +125,6 @@ final class SystemMetrics: @unchecked Sendable {
             }
         }
         return total
-    }
-}
-
-// MARK: - Profiler View
-
-struct ProfilerView: View {
-    let engine: FlashMoEEngine
-    @State private var metrics = SystemMetrics()
-    @State private var timer: Timer?
-
-    var body: some View {
-        VStack(spacing: 0) {
-            // Header
-            HStack {
-                Image(systemName: "gauge.with.dots.needle.50percent")
-                    .foregroundStyle(.orange)
-                Text("Profiler")
-                    .font(.caption.bold())
-                Spacer()
-                thermalBadge
-            }
-            .padding(.horizontal, 12)
-            .padding(.top, 8)
-            .padding(.bottom, 4)
-
-            Divider().opacity(0.3)
-
-            // Metrics grid
-            LazyVGrid(columns: [
-                GridItem(.flexible()),
-                GridItem(.flexible()),
-            ], spacing: 6) {
-                metricCell(
-                    icon: "memorychip",
-                    label: "RSS",
-                    value: String(format: "%.0f MB", metrics.residentMemoryMB)
-                )
-                metricCell(
-                    icon: "memorychip.fill",
-                    label: "Free",
-                    value: String(format: "%.0f MB", metrics.availableMemoryMB)
-                )
-                metricCell(
-                    icon: "cpu",
-                    label: "CPU",
-                    value: String(format: "%.0f%%", metrics.cpuUsagePercent)
-                )
-                metricCell(
-                    icon: "speedometer",
-                    label: engine.tokensGenerated < 0 ? "prefill t/s" : "tok/s",
-                    value: String(format: "%.1f", engine.tokensPerSecond)
-                )
-                metricCell(
-                    icon: "number",
-                    label: engine.tokensGenerated < 0 ? "Prefill" : "Tokens",
-                    value: engine.tokensGenerated < 0
-                        ? "\(-engine.tokensGenerated) tok"
-                        : "\(engine.tokensGenerated)"
-                )
-                metricCell(
-                    icon: "timer",
-                    label: "TTFT",
-                    value: engine.timeToFirstToken > 0
-                        ? String(format: "%.0f ms", engine.timeToFirstToken)
-                        : "--"
-                )
-            }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
-        }
-        .background(.ultraThinMaterial)
-        .clipShape(RoundedRectangle(cornerRadius: 12))
-        .shadow(color: .black.opacity(0.15), radius: 8, y: 2)
-        .padding(.horizontal)
-        .onAppear { startSampling() }
-        .onDisappear { stopSampling() }
-    }
-
-    // MARK: - Subviews
-
-    private func metricCell(icon: String, label: String, value: String) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: icon)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .frame(width: 14)
-            VStack(alignment: .leading, spacing: 0) {
-                Text(label)
-                    .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
-                Text(value)
-                    .font(.caption.monospacedDigit().bold())
-            }
-            Spacer()
-        }
-    }
-
-    private var thermalBadge: some View {
-        HStack(spacing: 3) {
-            Circle()
-                .fill(thermalColor)
-                .frame(width: 6, height: 6)
-            Text(thermalLabel)
-                .font(.system(size: 9).bold())
-                .foregroundStyle(thermalColor)
-        }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 2)
-        .background(thermalColor.opacity(0.12))
-        .clipShape(Capsule())
-    }
-
-    private var thermalColor: Color {
-        switch metrics.thermalState {
-        case .nominal: return .green
-        case .fair: return .yellow
-        case .serious: return .orange
-        case .critical: return .red
-        @unknown default: return .gray
-        }
-    }
-
-    private var thermalLabel: String {
-        switch metrics.thermalState {
-        case .nominal: return "Cool"
-        case .fair: return "Warm"
-        case .serious: return "Hot"
-        case .critical: return "Critical"
-        @unknown default: return "?"
-        }
-    }
-
-    // MARK: - Sampling
-
-    private func startSampling() {
-        metrics.sample() // initial
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
-            metrics.sample()
-        }
-    }
-
-    private func stopSampling() {
-        timer?.invalidate()
-        timer = nil
     }
 }
 

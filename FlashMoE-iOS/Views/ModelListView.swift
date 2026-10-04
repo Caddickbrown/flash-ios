@@ -1,8 +1,9 @@
 /*
- * ModelListView.swift — Model discovery and loading
+ * ModelListView.swift — Model library
  *
- * Lists locally available models and allows downloading from HuggingFace.
- * For v1, supports loading models already present on device.
+ * Custom scroll surface rather than a grouped List: device storage at the top,
+ * on-device models as cards (the loaded one ringed in amber), then the
+ * downloadable catalog.
  */
 
 import SwiftUI
@@ -20,6 +21,13 @@ struct LocalModel: Identifiable {
 
     var sizeMB: Double { Double(sizeBytes) / 1_048_576 }
     var sizeGB: Double { sizeMB / 1024 }
+
+    var quant: FMChip.QuantKind? {
+        if hasTiered { return .tiered }
+        if has4bit { return .fourBit }
+        if has2bit { return .twoBit }
+        return nil
+    }
 }
 
 // MARK: - Model List View
@@ -28,123 +36,168 @@ struct ModelListView: View {
     @Environment(FlashMoEEngine.self) private var engine
     @State private var localModels: [LocalModel] = []
     @State private var isScanning = true
-    @State private var loadError: String?
     @State private var selectedModel: LocalModel?
+    @State private var showSettings = false
+    @State private var detailEntry: CatalogEntry?
     @AppStorage("cacheIOSplit") private var cacheIOSplit: Int = 1
-    @AppStorage("chatTemplateEnabled") private var chatTemplateEnabled: Bool = true
     private let downloadManager = DownloadManager.shared
 
+    private var isLoading: Bool { engine.state == .loading }
+
     var body: some View {
-        List {
-            Section {
-                headerView
-            }
-            .listRowBackground(Color.clear)
-
-            if isScanning {
-                Section {
-                    HStack {
-                        ProgressView()
-                        Text("Scanning for models...")
-                            .foregroundStyle(.secondary)
-                    }
+        FMScreen {
+            if isLoading {
+                LoadingView(modelName: selectedModel?.name ?? "model", phase: engine.loadPhase) {
+                    engine.unloadModel()
+                    selectedModel = nil
                 }
-            } else if localModels.isEmpty {
-                Section {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("No models found")
-                            .font(.headline)
-                        Text("Download a model below, or transfer one via Files.app.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(.vertical, 4)
-                }
+                .transition(.opacity.combined(with: .scale(scale: 0.98)))
             } else {
-                Section("On Device") {
-                    ForEach(localModels) { model in
-                        ModelRow(model: model, isLoading: engine.state == .loading && selectedModel?.id == model.id)
-                            .onTapGesture { loadModel(model) }
+                library
+            }
+        }
+        .animation(.easeInOut(duration: 0.3), value: isLoading)
+        .sheet(isPresented: $showSettings) { SettingsSheet() }
+        .sheet(item: $detailEntry) { entry in
+            let hasActiveDownload = downloadManager.activeDownload?.catalogId == entry.id
+                && downloadManager.activeDownload?.status != .complete
+            ModelDetailView(
+                entry: entry,
+                downloadManager: downloadManager,
+                isDownloaded: !hasActiveDownload && downloadManager.isModelDownloaded(entry.id)
+            )
+        }
+        .onAppear { scanForModels() }
+        .onChange(of: downloadManager.activeDownload?.status) { _, newStatus in
+            if newStatus == .complete { scanForModels() }
+        }
+    }
+
+    // MARK: Library
+
+    private var library: some View {
+        VStack(spacing: 0) {
+            header
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    StorageCard(models: localModels)
+
+                    if let message = errorMessage {
+                        errorCard(message)
+                    }
+
+                    FMLabel("on device")
+                        .padding(.leading, 3)
+
+                    if isScanning {
+                        scanningCard
+                    } else if localModels.isEmpty {
+                        emptyCard
+                    } else {
+                        ForEach(localModels) { model in
+                            ModelCard(
+                                model: model,
+                                isLoaded: engine.modelInfo?.name == model.path
+                            ) {
+                                loadModel(model)
+                            }
+                        }
+                    }
+
+                    FMLabel("available")
+                        .padding(.top, 4)
+                        .padding(.leading, 3)
+
+                    ForEach(ModelCatalog.models) { entry in
+                        let hasActiveDownload = downloadManager.activeDownload?.catalogId == entry.id
+                            && downloadManager.activeDownload?.status != .complete
+                        ModelDownloadRow(
+                            entry: entry,
+                            downloadManager: downloadManager,
+                            isDownloaded: !hasActiveDownload && downloadManager.isModelDownloaded(entry.id),
+                            onOpen: { detailEntry = entry }
+                        )
                     }
                 }
+                .padding(.horizontal, FM.S.gutter)
+                .padding(.bottom, 28)
             }
-
-            // Download section
-            Section("Download from HuggingFace") {
-                ForEach(ModelCatalog.models) { entry in
-                    let hasActiveDownload = downloadManager.activeDownload?.catalogId == entry.id
-                        && downloadManager.activeDownload?.status != .complete
-                    ModelDownloadRow(
-                        entry: entry,
-                        downloadManager: downloadManager,
-                        isDownloaded: !hasActiveDownload && downloadManager.isModelDownloaded(entry.id)
-                    )
-                }
-            }
-
-            Section("I/O Settings") {
-                Picker("Expert I/O Fanout", selection: $cacheIOSplit) {
-                    Text("Off (single pread)").tag(1)
-                    Text("2 chunks").tag(2)
-                    Text("4 chunks").tag(4)
-                    Text("8 chunks").tag(8)
-                }
-                .pickerStyle(.menu)
-                if cacheIOSplit > 1 {
-                    Text("Splits each expert read into \(cacheIOSplit) page-aligned chunks for parallel SSD reads. Reload model to apply.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            Section("Chat Settings") {
-                Toggle("Chat Template", isOn: $chatTemplateEnabled)
-                Text("Wraps prompts in Qwen chat format (<|im_start|>). Disable for smoke test models or raw text mode.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            if let error = downloadManager.error,
-               downloadManager.activeDownload == nil {
-                Section {
-                    Label(error, systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(.red)
-                        .font(.caption)
-                }
-            }
-
-            if case .error(let msg) = engine.state {
-                Section {
-                    Label(msg, systemImage: "exclamationmark.triangle")
-                        .foregroundStyle(.red)
-                        .font(.caption)
-                }
-            }
+            .scrollIndicators(.hidden)
+            .refreshable { scanForModels() }
         }
-        .navigationTitle("Flash-MoE")
-        .onAppear { scanForModels() }
-        .refreshable { scanForModels() }
-        .onChange(of: downloadManager.activeDownload?.status) { _, newStatus in
-            if newStatus == .complete {
-                scanForModels()
+    }
+
+    private var header: some View {
+        HStack(alignment: .top) {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 8) {
+                    Image(systemName: "bolt.fill")
+                        .font(.system(size: 17))
+                        .foregroundStyle(FM.flash)
+                    Text("Models")
+                        .font(FM.titleL)
+                        .kerning(-0.7)
+                        .foregroundStyle(FM.ink)
+                }
+                Text("Mixture-of-experts, streamed from storage.")
+                    .font(FM.sans(13))
+                    .foregroundStyle(FM.secondary)
+            }
+            Spacer(minLength: 8)
+            FMIconButton(system: "slider.horizontal.3", label: "Settings") { showSettings = true }
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 4)
+        .padding(.bottom, 16)
+    }
+
+    private var errorMessage: String? {
+        if case .error(let msg) = engine.state { return msg }
+        if let err = downloadManager.error, downloadManager.activeDownload == nil { return err }
+        return nil
+    }
+
+    private func errorCard(_ message: String) -> some View {
+        FMCard(fill: FM.danger.opacity(0.08), stroke: FM.danger.opacity(0.25)) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.system(size: 13))
+                    .foregroundStyle(FM.danger)
+                Text(message)
+                    .font(FM.sans(12.5))
+                    .lineSpacing(2)
+                    .foregroundStyle(FM.danger)
             }
         }
     }
 
-    private var headerView: some View {
-        VStack(spacing: 8) {
-            Image(systemName: "bolt.fill")
-                .font(.system(size: 48))
-                .foregroundStyle(.orange)
-            Text("Flash-MoE")
-                .font(.largeTitle.bold())
-            Text("Run massive MoE models on iPhone")
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+    private var scanningCard: some View {
+        FMCard {
+            HStack(spacing: 10) {
+                FMPulse(color: FM.stream)
+                Text("Scanning for models…")
+                    .font(FM.sans(13.5))
+                    .foregroundStyle(FM.secondary)
+            }
         }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical)
     }
+
+    private var emptyCard: some View {
+        FMCard(fill: FM.sunken, stroke: Color.white.opacity(0.055)) {
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Nothing on device yet")
+                    .font(FM.sans(14.5, .semibold))
+                    .foregroundStyle(FM.body)
+                Text("Download one below, or drop a packed model into the Flash-MoE folder in Files.")
+                    .font(FM.sans(12.5))
+                    .lineSpacing(2)
+                    .foregroundStyle(FM.tertiary)
+            }
+        }
+    }
+
+    // MARK: Actions
 
     private func scanForModels() {
         isScanning = true
@@ -180,59 +233,215 @@ struct ModelListView: View {
     }
 }
 
-// MARK: - Model Row
+// MARK: - Storage Card
 
-struct ModelRow: View {
-    let model: LocalModel
-    let isLoading: Bool
+struct StorageCard: View {
+    let models: [LocalModel]
+
+    private var usedBytes: UInt64 { models.reduce(0) { $0 + $1.sizeBytes } }
+
+    private var freeBytes: UInt64 {
+        guard let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first,
+              let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+              let capacity = values.volumeAvailableCapacityForImportantUsage else { return 0 }
+        return UInt64(max(capacity, 0))
+    }
 
     var body: some View {
-        HStack {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(model.name)
-                    .font(.headline)
+        FMCard(radius: 18) {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(alignment: .firstTextBaseline) {
+                    FMLabel("device storage")
+                    Spacer()
+                    Text(String(format: "%.1f GB used · %.0f GB free", gb(usedBytes), gb(freeBytes)))
+                        .font(FM.mono(11))
+                        .monospacedDigit()
+                        .foregroundStyle(Color(hex: 0xC7CCD4))
+                }
 
-                HStack(spacing: 8) {
-                    if model.hasTiered {
-                        QuantBadge(text: "Tiered", color: .green)
-                    } else if model.has4bit {
-                        QuantBadge(text: "4-bit", color: .blue)
-                    } else if model.has2bit {
-                        QuantBadge(text: "2-bit", color: .orange)
-                    }
+                FMMeter(value: fraction, tint: FM.flash, height: 7)
 
-                    Text(String(format: "%.1f GB", model.sizeGB))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                HStack(spacing: 14) {
+                    legend(FM.flash, "Models \(String(format: "%.1f GB", gb(usedBytes)))")
+                    legend(Color.white.opacity(0.18), "Free \(String(format: "%.0f GB", gb(freeBytes)))")
                 }
             }
-
-            Spacer()
-
-            if isLoading {
-                ProgressView()
-            } else {
-                Image(systemName: "chevron.right")
-                    .foregroundStyle(.secondary)
-            }
         }
-        .padding(.vertical, 4)
-        .contentShape(Rectangle())
+    }
+
+    private var fraction: Double {
+        let total = Double(usedBytes) + Double(freeBytes)
+        guard total > 0 else { return 0 }
+        return Double(usedBytes) / total
+    }
+
+    private func gb(_ bytes: UInt64) -> Double { Double(bytes) / 1_073_741_824 }
+
+    private func legend(_ color: Color, _ text: String) -> some View {
+        HStack(spacing: 5) {
+            Circle().fill(color).frame(width: 6, height: 6)
+            Text(text)
+                .font(FM.sans(10.5))
+                .foregroundStyle(FM.secondary)
+        }
     }
 }
 
-struct QuantBadge: View {
-    let text: String
-    let color: Color
+// MARK: - Model Card
+
+struct ModelCard: View {
+    let model: LocalModel
+    let isLoaded: Bool
+    let onLoad: () -> Void
 
     var body: some View {
-        Text(text)
-            .font(.caption2.bold())
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(color.opacity(0.15))
-            .foregroundStyle(color)
-            .clipShape(Capsule())
+        FMCard(
+            fill: isLoaded ? FM.raised : FM.card,
+            stroke: isLoaded ? FM.flash.opacity(0.38) : FM.hairline
+        ) {
+            VStack(alignment: .leading, spacing: 0) {
+                HStack(alignment: .top, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 9) {
+                        Text(model.name)
+                            .font(FM.sans(16, .semibold))
+                            .kerning(-0.2)
+                            .foregroundStyle(FM.ink)
+                            .lineLimit(2)
+
+                        HStack(spacing: 6) {
+                            if let quant = model.quant { FMChip.quant(quant) }
+                            FMChip(text: String(format: "%.1f gb", model.sizeGB))
+                        }
+                    }
+
+                    Spacer(minLength: 6)
+
+                    if isLoaded {
+                        HStack(spacing: 5) {
+                            FMPulse(color: FM.flash, size: 5)
+                            FMLabel("loaded", color: FM.flash)
+                        }
+                        .padding(.horizontal, 9)
+                        .padding(.vertical, 5)
+                        .background(FM.flash.opacity(0.13), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+                    } else {
+                        Button("Load", action: onLoad)
+                            .buttonStyle(FMPrimaryButton())
+                    }
+                }
+
+                if isLoaded {
+                    Divider()
+                        .overlay(FM.hairline)
+                        .padding(.vertical, 12)
+
+                    HStack {
+                        Text("Ready for chat")
+                            .font(FM.mono(10))
+                            .foregroundStyle(FM.secondary)
+                        Spacer()
+                        HStack(spacing: 6) {
+                            Text("Open chat")
+                                .font(FM.sans(13.5, .semibold))
+                            Image(systemName: "chevron.right")
+                                .font(FM.sans(11, .bold))
+                        }
+                        .foregroundStyle(FM.flash)
+                    }
+                }
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { if !isLoaded { onLoad() } }
+    }
+}
+
+// MARK: - Settings Sheet
+
+struct SettingsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("cacheIOSplit") private var cacheIOSplit: Int = 1
+    @AppStorage("chatTemplateEnabled") private var chatTemplateEnabled: Bool = true
+
+    var body: some View {
+        ZStack {
+            FM.ground.ignoresSafeArea()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    sheetHeader(title: "Settings", dismiss: dismiss)
+
+                    FMCard {
+                        VStack(alignment: .leading, spacing: 12) {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("Chat template")
+                                        .font(FM.sans(14, .semibold))
+                                        .foregroundStyle(FM.ink)
+                                    Text("Wrap prompts in the Qwen format. Turn off for smoke-test models or raw completion.")
+                                        .font(FM.sans(11.5))
+                                        .lineSpacing(2)
+                                        .foregroundStyle(FM.tertiary)
+                                }
+                                Spacer(minLength: 10)
+                                Toggle("", isOn: $chatTemplateEnabled)
+                                    .labelsHidden()
+                                    .tint(FM.flash)
+                            }
+                        }
+                    }
+
+                    FMCard {
+                        VStack(alignment: .leading, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text("Expert I/O fanout")
+                                    .font(FM.sans(14, .semibold))
+                                    .foregroundStyle(FM.ink)
+                                Text("Splits each expert read into page-aligned chunks issued in parallel. Applies on the next load.")
+                                    .font(FM.sans(11.5))
+                                    .lineSpacing(2)
+                                    .foregroundStyle(FM.tertiary)
+                            }
+
+                            HStack(spacing: 3) {
+                                ForEach([1, 2, 4, 8], id: \.self) { n in
+                                    Button {
+                                        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { cacheIOSplit = n }
+                                    } label: {
+                                        Text(n == 1 ? "Off" : "\(n)×")
+                                            .font(FM.mono(11.5))
+                                            .foregroundStyle(cacheIOSplit == n ? FM.onFlash : FM.secondary)
+                                            .frame(maxWidth: .infinity, minHeight: 34)
+                                            .background(
+                                                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                                    .fill(cacheIOSplit == n ? FM.flash : Color.clear)
+                                            )
+                                    }
+                                    .buttonStyle(.plain)
+                                }
+                            }
+                            .padding(3)
+                            .background(Color.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 13, style: .continuous))
+                        }
+                    }
+
+                    Text("Models live in the app's Documents folder and are excluded from backup so iOS will not purge them.")
+                        .font(FM.sans(11.5))
+                        .lineSpacing(3)
+                        .foregroundStyle(FM.faint)
+                        .padding(.horizontal, 3)
+                }
+                .padding(FM.S.gutter)
+            }
+            .scrollIndicators(.hidden)
+        }
+        .preferredColorScheme(.dark)
+#if os(iOS)
+        .presentationDetents([.medium, .large])
+        .presentationBackground(FM.ground)
+        .presentationDragIndicator(.visible)
+#else
+        .frame(minWidth: 420, minHeight: 420)
+#endif
     }
 }
 
